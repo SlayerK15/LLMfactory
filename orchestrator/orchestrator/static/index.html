@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Collection System — Pipeline</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="dot"></span>
+      <span>Collection System</span>
+    </div>
+    <span class="tag">orchestrator</span>
+  </header>
+
+  <main class="layout">
+    <section class="panel controls">
+      <h1>Fine-tune on any topic</h1>
+      <p class="sub">Enter a topic. The pipeline collects documents, cleans them, builds a dataset, and optionally fine-tunes a model.</p>
+
+      <form id="pipeline-form" autocomplete="off">
+        <label>Topic
+          <input name="topic" type="text" placeholder="e.g. Kubernetes" required maxlength="200" />
+        </label>
+
+        <div class="row two">
+          <label>Docs
+            <input name="doc_count" type="number" value="500" min="10" max="50000" />
+          </label>
+          <label>Dataset style
+            <select name="output_mode">
+              <option value="pretrain">Pretraining (raw text)</option>
+              <option value="instruct">Instruction tuning (Q/A pairs)</option>
+            </select>
+          </label>
+        </div>
+
+        <fieldset class="mode-picker">
+          <legend>Mode</legend>
+          <label class="mode-option">
+            <input type="radio" name="mode" value="dataset_only" checked />
+            <div>
+              <strong>Dataset only</strong>
+              <span>Collect → clean → forge. Stops with a training-ready JSONL.</span>
+            </div>
+          </label>
+          <label class="mode-option">
+            <input type="radio" name="mode" value="train" />
+            <div>
+              <strong>Dataset + train</strong>
+              <span>Same as above, then LoRA fine-tune on Modal and export a GGUF.</span>
+            </div>
+          </label>
+        </fieldset>
+
+        <div id="train-knobs" class="train-knobs" hidden>
+          <label>Base model
+            <input name="base_model" type="text" value="unsloth/Llama-3.2-3B-Instruct-bnb-4bit" />
+          </label>
+          <div class="row three">
+            <label>Epochs
+              <input name="epochs" type="number" value="1" min="1" max="20" />
+            </label>
+            <label>LoRA rank
+              <input name="lora_rank" type="number" value="16" min="4" max="128" />
+            </label>
+            <label>Output format
+              <select name="output_format">
+                <option value="gguf_q4_k_m">GGUF q4_k_m</option>
+                <option value="gguf_q8_0">GGUF q8_0</option>
+                <option value="safetensors">safetensors</option>
+              </select>
+            </label>
+          </div>
+          <label>S3 bucket <span class="hint">optional — leaves the artifact local if empty</span>
+            <input name="s3_bucket" type="text" placeholder="my-artifacts-bucket" />
+          </label>
+        </div>
+
+        <div class="actions">
+          <label class="inline"><input type="checkbox" id="dry-run" /> Dry run (fakes all stages)</label>
+          <button id="start" type="submit">Start pipeline</button>
+        </div>
+      </form>
+
+      <section id="summary" class="summary" hidden>
+        <h3>Artifacts</h3>
+        <ul id="summary-list"></ul>
+      </section>
+    </section>
+
+    <section class="panel stream">
+      <div class="stages" id="stages">
+        <div class="stage" data-stage="init">Init</div>
+        <div class="stage" data-stage="collect">Collect</div>
+        <div class="stage" data-stage="clean">Clean</div>
+        <div class="stage" data-stage="forge">Forge</div>
+        <div class="stage" data-stage="train" data-optional>Train</div>
+        <div class="stage" data-stage="done">Done</div>
+      </div>
+
+      <div class="log-toolbar">
+        <div class="filters">
+          <button type="button" class="chip active" data-filter="all">All</button>
+          <button type="button" class="chip" data-filter="stage">Stage</button>
+          <button type="button" class="chip" data-filter="log">Logs</button>
+          <button type="button" class="chip" data-filter="err">Errors</button>
+        </div>
+        <div class="toolbar-right">
+          <label class="inline small"><input type="checkbox" id="autoscroll" checked /> Auto-scroll</label>
+          <button type="button" id="clear-log" class="ghost">Clear</button>
+        </div>
+      </div>
+
+      <pre id="log" aria-live="polite"></pre>
+      <div class="log-footer">
+        <span id="status-pill" class="status idle">idle</span>
+        <span id="counter">0 events</span>
+      </div>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

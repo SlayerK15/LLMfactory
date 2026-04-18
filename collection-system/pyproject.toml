@@ -1,0 +1,64 @@
+[project]
+name = "collection-system"
+version = "0.1.0"
+description = "Agent-driven data collection pipeline for LLM fine-tuning"
+requires-python = ">=3.13"
+
+dependencies = [
+    "fastapi==0.136.0",
+    "uvicorn[standard]>=0.34",
+    "pydantic==2.13.2",
+    "pydantic-settings==2.13.1",
+    "langgraph==1.1.6",
+    "groq==1.1.2",
+    "crawl4ai==0.8.6",
+    "playwright==1.58.0",
+    "httpx==0.28.1",
+    "cdx-toolkit==0.9.38",
+    "tenacity==9.1.4",
+    "pybreaker==1.4.1",
+    "sqlalchemy==2.0.49",
+    "asyncpg==0.31.0",
+    "alembic==1.18.4",
+    "prometheus-client==0.25.0",
+    "structlog==25.5.0",
+    "typer==0.24.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.3",
+    "pytest-asyncio==1.3.0",
+    "ruff==0.15.11",
+    "mypy==1.20.1",
+    "vcrpy>=6.0",
+    "hypothesis>=6.130",
+]
+
+[project.scripts]
+collect = "collection_system.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+python = "3.13"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "slow: marks tests as slow (deselect with '-m not slow')",
+    "integration: marks tests requiring live services",
+]
