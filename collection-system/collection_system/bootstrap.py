@@ -5,6 +5,10 @@ Entry points (api.py, cli.py) call build_adapters() to get a runnable bundle.
 """
 from __future__ import annotations
 
+from contextlib import suppress
+
+from collection_system.adapters.llm.cerebras_adapter import CerebrasAdapter
+from collection_system.adapters.llm.failover_adapter import FailoverLLMAdapter
 from collection_system.adapters.llm.groq_adapter import GroqAdapter
 from collection_system.adapters.llm.ollama_adapter import OllamaAdapter
 from collection_system.adapters.scraper.crawl4ai_adapter import Crawl4AIAdapter
@@ -16,23 +20,53 @@ from collection_system.adapters.storage.filesystem import FilesystemAdapter
 from collection_system.adapters.storage.postgres import PostgresStorageAdapter
 from collection_system.core.constants import SearchBackend
 from collection_system.core.models import AdapterBundle, RunConfig
+from collection_system.core.ports import LLMPort
 from collection_system.infra.config import Settings, get_settings
 from collection_system.infra.db import init_db
 
 
-def build_llm(settings: Settings):
-    """Select the configured LLM provider."""
-    if settings.llm_provider == "groq" and settings.groq_api_key:
+def _build_llm_provider(settings: Settings, provider: str) -> LLMPort:
+    provider_name = provider.lower().strip()
+    if provider_name == "groq":
+        if not settings.groq_api_key:
+            raise ValueError("GROQ_API_KEY is required when llm provider is groq")
         return GroqAdapter(
             api_key=settings.groq_api_key,
             model=settings.groq_model,
             max_depth=settings.max_depth,
         )
-    return OllamaAdapter(
-        base_url=settings.ollama_base_url,
-        model=settings.ollama_model,
-        max_depth=settings.max_depth,
-    )
+    if provider_name == "cerebras":
+        if not settings.cerebras_api_key:
+            raise ValueError("CEREBRAS_API_KEY is required when llm provider is cerebras")
+        return CerebrasAdapter(
+            api_key=settings.cerebras_api_key,
+            base_url=settings.cerebras_base_url,
+            model=settings.cerebras_model,
+            max_depth=settings.max_depth,
+        )
+    if provider_name == "ollama":
+        return OllamaAdapter(
+            base_url=settings.ollama_base_url,
+            model=settings.ollama_model,
+            max_depth=settings.max_depth,
+        )
+    raise ValueError(f"Unsupported llm provider: {provider}")
+
+
+def build_llm(settings: Settings) -> LLMPort:
+    """Select the configured LLM provider and optional fallback provider."""
+    primary = _build_llm_provider(settings, settings.llm_provider)
+
+    fallback_provider = settings.llm_fallback_provider.strip()
+    if fallback_provider:
+        fallback = _build_llm_provider(settings, fallback_provider)
+        return FailoverLLMAdapter(primary=primary, fallback=fallback)
+
+    if settings.llm_provider == "groq" and settings.cerebras_api_key:
+        fallback = _build_llm_provider(settings, "cerebras")
+        return FailoverLLMAdapter(primary=primary, fallback=fallback)
+
+    return primary
 
 
 def build_search(settings: Settings, enabled: list[SearchBackend]):
@@ -80,10 +114,8 @@ async def build_adapters(
     s = settings or get_settings()
     if s.database_url:
         # Idempotent — safe to call multiple times; subsequent calls no-op.
-        try:
+        with suppress(Exception):  # already initialised
             init_db(s.database_url)
-        except Exception:  # noqa: BLE001 — already initialised
-            pass
 
     return AdapterBundle(
         llm=build_llm(s),

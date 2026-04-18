@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
     llm_provider: str = "groq"
     groq_model: str = "llama-3.3-70b-versatile"
+    cerebras_api_key: str = Field(default="", alias="CEREBRAS_API_KEY")
+    cerebras_base_url: str = Field(default="https://api.cerebras.ai", alias="CEREBRAS_BASE_URL")
+    cerebras_model: str = "llama-3.3-70b"
+    llm_fallback_provider: str = ""
     ollama_model: str = "qwen2.5:7b"
 
     # Database
