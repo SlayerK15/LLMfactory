@@ -5,6 +5,8 @@ Entry points (api.py, cli.py) call build_adapters() to get a runnable bundle.
 """
 from __future__ import annotations
 
+import structlog
+
 from collection_system.adapters.llm.cerebras_adapter import CerebrasAdapter
 from collection_system.adapters.llm.failover_adapter import FailoverLLMAdapter
 from collection_system.adapters.llm.groq_adapter import GroqAdapter
@@ -23,7 +25,9 @@ from collection_system.core.constants import SearchBackend
 from collection_system.core.models import AdapterBundle, RunConfig
 from collection_system.core.ports import LLMPort
 from collection_system.infra.config import Settings, get_settings
-from collection_system.infra.db import init_db
+from collection_system.infra.db import ensure_schema, init_db
+
+log = structlog.get_logger()
 
 
 def _build_llm_provider(settings: Settings, provider: str) -> LLMPort:
@@ -126,8 +130,12 @@ async def build_adapters(
         # Idempotent — safe to call multiple times; subsequent calls no-op.
         try:
             init_db(s.database_url)
-        except Exception:  # noqa: BLE001 — already initialised
-            pass
+        except Exception as exc:  # noqa: BLE001 — already initialised
+            log.debug("bootstrap.db_init_skipped", error=str(exc))
+        try:
+            await ensure_schema()
+        except Exception as exc:  # noqa: BLE001 — schema creation is best effort
+            log.warning("bootstrap.ensure_schema_failed", error=str(exc))
 
     return AdapterBundle(
         llm=build_llm(s),

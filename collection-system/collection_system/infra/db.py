@@ -33,6 +33,20 @@ def init_db(database_url: str) -> None:
     )
 
 
+async def ensure_schema() -> None:
+    """
+    Create persistence tables if they do not exist yet.
+    Safe to call repeatedly; used as a lightweight bootstrap guardrail when
+    migrations were not applied in a fresh environment.
+    """
+    engine = get_engine()
+    # Import ORM models so SQLAlchemy metadata is fully registered.
+    from collection_system.adapters.storage import orm  # noqa: F401
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
 def get_engine() -> AsyncEngine:
     if _engine is None:
         raise RuntimeError("Database not initialised — call init_db() first")
