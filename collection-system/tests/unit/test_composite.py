@@ -1,18 +1,18 @@
 """Unit tests for CompositeSearchAdapter — dedup, fan-out, circuit-breaker skips."""
 from __future__ import annotations
 
+from contextlib import suppress
 from uuid import uuid4
 
 import pytest
 
 from collection_system.adapters.search.composite import CompositeSearchAdapter
 from collection_system.core.constants import SearchBackend
-from collection_system.core.errors import CircuitOpenError
+from collection_system.core.errors import SearchError
 from collection_system.core.models import DiscoveredURL, Query
 from collection_system.core.ports import RateLimit
 from collection_system.infra.circuit_breaker import CircuitBreakerRegistry
 from collection_system.infra.rate_limiter import RateLimiterRegistry
-
 
 # ---------------------------------------------------------------------------
 # Fixtures / stub backends
@@ -127,6 +127,46 @@ async def test_composite_tolerates_one_backend_failure(query: Query) -> None:
 
 
 @pytest.mark.asyncio
+async def test_composite_raises_when_all_backends_fail(query: Query) -> None:
+    b1 = StubBackend("b1", [], raise_exc=RuntimeError("down"))
+    b2 = StubBackend("b2", [], raise_exc=RuntimeError("also down"))
+    composite = CompositeSearchAdapter(backends=[b1, b2])
+
+    with pytest.raises(SearchError):
+        await composite.discover_urls(query, limit=10)
+
+
+@pytest.mark.asyncio
+async def test_composite_relaxes_query_when_initial_search_returns_nothing(
+    query: Query,
+) -> None:
+    class RelaxedOnlyBackend(StubBackend):
+        async def discover_urls(
+            self, query: Query, limit: int = 20
+        ) -> list[DiscoveredURL]:
+            self.call_count += 1
+            if query.text == "devops pipelines":
+                return []
+            return [
+                DiscoveredURL(
+                    run_id=query.run_id,
+                    query_id=query.id,
+                    url="https://docs.example.com/devops-overview",
+                    domain="docs.example.com",
+                    source_backend=SearchBackend.CC_CDX,
+                )
+            ]
+
+    backend = RelaxedOnlyBackend("relaxed", [])
+    composite = CompositeSearchAdapter(backends=[backend])
+
+    results = await composite.discover_urls(query, limit=10)
+
+    assert len(results) == 1
+    assert backend.call_count == 2
+
+
+@pytest.mark.asyncio
 async def test_composite_returns_empty_when_no_backends(query: Query) -> None:
     composite = CompositeSearchAdapter(backends=[])
     results = await composite.discover_urls(query, limit=10)
@@ -146,10 +186,8 @@ async def test_composite_skips_open_circuit(query: Query) -> None:
     cb = breakers.get("b1")
     assert cb is not None
     for _ in range(10):
-        try:
+        with suppress(Exception):
             cb.call(lambda: (_ for _ in ()).throw(RuntimeError("trip")))
-        except Exception:
-            pass
     assert cb.current_state == "open"
 
     composite = CompositeSearchAdapter(backends=[b1, b2], breakers=breakers)

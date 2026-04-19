@@ -6,12 +6,13 @@ Respects per-backend rate limits + circuit breakers.
 from __future__ import annotations
 
 import asyncio
+import re
 
 import pybreaker
 import structlog
 
 from collection_system.adapters.search.base import url_hash
-from collection_system.core.errors import CircuitOpenError
+from collection_system.core.errors import CircuitOpenError, SearchError
 from collection_system.core.models import DiscoveredURL, Query
 from collection_system.core.ports import RateLimit, SearchPort
 from collection_system.infra.circuit_breaker import CircuitBreakerRegistry
@@ -78,18 +79,48 @@ class CompositeSearchAdapter:
         if not self._backends:
             return []
 
+        merged, failed_backends = await self._discover_once(query, limit)
+        if merged:
+            return merged
+
+        if failed_backends == len(self._backends):
+            raise SearchError(f"all search backends failed for query={query.text!r}")
+
+        relaxed_text = self._relax_query(query.text)
+        if relaxed_text and relaxed_text != query.text:
+            relaxed_query = query.model_copy(update={"text": relaxed_text})
+            merged, relaxed_failed_backends = await self._discover_once(
+                relaxed_query, limit
+            )
+            if merged:
+                log.info(
+                    "composite.query_relaxed_recovered",
+                    original=query.text,
+                    relaxed=relaxed_text,
+                    returned=len(merged),
+                )
+                return merged
+            if relaxed_failed_backends == len(self._backends):
+                raise SearchError(
+                    "all search backends failed for both original and relaxed query"
+                )
+        return []
+
+    async def _discover_once(
+        self,
+        query: Query,
+        limit: int,
+    ) -> tuple[list[DiscoveredURL], int]:
         # Request each backend slightly over fair-share so unique-after-dedup ≈ limit.
         per_backend = max(5, (limit * 2) // max(1, len(self._backends)))
-
-        tasks = [
-            self._call_one(backend, query, per_backend) for backend in self._backends
-        ]
+        tasks = [self._call_one(backend, query, per_backend) for backend in self._backends]
         batches = await asyncio.gather(*tasks, return_exceptions=True)
-
         seen: set[str] = set()
         merged: list[DiscoveredURL] = []
-        for backend, batch in zip(self._backends, batches):
+        failed_backends = 0
+        for backend, batch in zip(self._backends, batches, strict=False):
             if isinstance(batch, BaseException):
+                failed_backends += 1
                 log.warning(
                     "composite.backend_failed",
                     backend=backend.name,
@@ -112,8 +143,26 @@ class CompositeSearchAdapter:
             query=query.text,
             backends=len(self._backends),
             returned=len(merged),
+            failed_backends=failed_backends,
         )
-        return merged
+        return merged, failed_backends
+
+    def _relax_query(self, text: str) -> str:
+        """
+        Build a broader fallback query from informative tokens.
+        Example: "AI infrastructure observability patterns" -> "ai infrastructure observability".
+        """
+        tokens = re.findall(r"[a-zA-Z0-9]+", text.lower())
+        kept: list[str] = []
+        for token in tokens:
+            if len(token) <= 2:
+                continue
+            if token in {"with", "from", "into", "about", "guide", "tutorial"}:
+                continue
+            kept.append(token)
+            if len(kept) == 3:
+                break
+        return " ".join(kept)
 
     async def health_check(self) -> bool:
         results = await asyncio.gather(
