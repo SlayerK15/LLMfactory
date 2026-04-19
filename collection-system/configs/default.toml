@@ -40,7 +40,7 @@ retry_attempts = 3
 retry_backoff_base_s = 2.0
 
 [reliability]
-global_timeout_s = 1800
+global_timeout_s = 5400
 stage_timeout_query_s = 120
 stage_timeout_discovery_s = 300
 stage_timeout_scrape_s = 1200

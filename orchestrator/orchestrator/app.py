@@ -1,6 +1,16 @@
 """FastAPI app with SSE streaming + static frontend."""
 from __future__ import annotations
 
+import sys
+
+# Force UTF-8 stdio on Windows so Crawl4AI's unicode progress chars (e.g. ↓)
+# don't crash scrapes with `charmap codec can't encode` (cp1252 default).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import asyncio
 import json
 from collections.abc import AsyncIterator

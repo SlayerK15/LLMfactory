@@ -8,7 +8,7 @@ import httpx
 import structlog
 
 from collection_system.adapters.search.base import extract_domain, normalize_url
-from collection_system.adapters.search.cc_cdx import BLOCKED_DOMAINS
+from collection_system.adapters.search.blocklist import is_blocked
 from collection_system.core.constants import SearchBackend, URLStatus
 from collection_system.core.errors import SearchError
 from collection_system.core.models import DiscoveredURL, Query
@@ -41,6 +41,8 @@ class SearXNGAdapter:
         engines: str | None = None,
         timeout_s: float = 15.0,
         max_instance_retries: int = 3,
+        language: str = "en",
+        safesearch: str = "1",
     ) -> None:
         urls = [u.strip().rstrip("/") for u in base_url.split(",") if u.strip()]
         if not urls:
@@ -55,6 +57,8 @@ class SearXNGAdapter:
         self._engines = engines  # e.g. "duckduckgo,brave" — None uses server default
         self._timeout_s = timeout_s
         self._max_instance_retries = max(1, min(max_instance_retries, len(urls)))
+        self._language = language
+        self._safesearch = safesearch
         self._clients: dict[str, httpx.AsyncClient] = {}
 
     @property
@@ -100,7 +104,8 @@ class SearXNGAdapter:
             "q": query.text,
             "format": "json",
             "categories": self._categories,
-            "safesearch": "0",
+            "safesearch": self._safesearch,
+            "language": self._language,
             "pageno": "1",
         }
         if self._engines:
@@ -150,9 +155,11 @@ class SearXNGAdapter:
             if normed in seen:
                 continue
             domain = extract_domain(normed)
-            if domain in BLOCKED_DOMAINS:
+            if is_blocked(domain, normed):
                 continue
             seen.add(normed)
+            title = (item.get("title") or "").strip() or None
+            snippet = (item.get("content") or "").strip() or None
             results.append(
                 DiscoveredURL(
                     run_id=query.run_id,
@@ -161,6 +168,8 @@ class SearXNGAdapter:
                     domain=domain,
                     source_backend=SearchBackend.SEARXNG,
                     status=URLStatus.PENDING,
+                    title=title,
+                    snippet=snippet,
                 )
             )
             if len(results) >= limit:

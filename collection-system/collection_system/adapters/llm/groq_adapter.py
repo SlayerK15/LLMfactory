@@ -13,14 +13,17 @@ from collection_system.agents.prompts import (
     EXPAND_TOPIC_USER,
     SCORE_RELEVANCE_SYSTEM,
     SCORE_RELEVANCE_USER,
+    VALIDATE_URLS_SYSTEM,
+    VALIDATE_URLS_USER,
 )
 from collection_system.core.errors import LLMError, LLMRateLimitError
 
 log = structlog.get_logger()
 
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
-EXPAND_COUNT = 6
+EXPAND_COUNT = 12
 SCORE_BATCH_SIZE = 20
+VALIDATE_BATCH_SIZE = 25
 
 
 def _parse_json_array(text: str) -> list:
@@ -123,6 +126,48 @@ class GroqAdapter:
             raise
         except Exception as exc:
             raise LLMError(f"score_relevance failed: {exc}") from exc
+
+    async def validate_urls(
+        self,
+        topic: str,
+        query: str,
+        items: list[tuple[str, str | None, str | None]],
+    ) -> list[bool]:
+        """
+        Ask the LLM to keep/drop each candidate URL based on its title+snippet.
+        Batches calls so we don't blow the context window on large URL lists.
+        Never fails the pipeline — on error, defaults to "keep all" for the batch.
+        """
+        if not items:
+            return []
+
+        out: list[bool] = []
+        for start in range(0, len(items), VALIDATE_BATCH_SIZE):
+            chunk = items[start : start + VALIDATE_BATCH_SIZE]
+            rendered = "\n".join(
+                f"{i + 1}. {url} — {(title or '(no title)').strip()[:140]} — "
+                f"{(snippet or '').strip()[:200]}"
+                for i, (url, title, snippet) in enumerate(chunk)
+            )
+            user_prompt = VALIDATE_URLS_USER.format(
+                topic=topic, query=query, items=rendered
+            )
+            try:
+                raw = await self._chat(VALIDATE_URLS_SYSTEM, user_prompt)
+                parsed = _parse_json_array(raw)
+                if not isinstance(parsed, list) or len(parsed) != len(chunk):
+                    log.warning(
+                        "validate_urls.length_mismatch",
+                        expected=len(chunk),
+                        got=len(parsed) if isinstance(parsed, list) else "n/a",
+                    )
+                    out.extend([True] * len(chunk))
+                    continue
+                out.extend(bool(int(v)) for v in parsed)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("validate_urls.failed", error=str(exc))
+                out.extend([True] * len(chunk))
+        return out
 
     async def health_check(self) -> bool:
         try:

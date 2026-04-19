@@ -49,6 +49,20 @@ class LLMPort(Protocol):
         """Score each query 0.0–1.0 against the root topic."""
         ...
 
+    async def validate_urls(
+        self,
+        topic: str,
+        query: str,
+        items: list[tuple[str, str | None, str | None]],
+    ) -> list[bool]:
+        """
+        Decide whether each (url, title, snippet) candidate is worth scraping
+        for the given topic/query. Returns a list[bool] of the same length —
+        True = keep, False = drop. Must be tolerant of malformed LLM output
+        (fall back to keep-all rather than failing the stage).
+        """
+        ...
+
     async def health_check(self) -> bool:
         """Return True if the LLM provider is reachable."""
         ...

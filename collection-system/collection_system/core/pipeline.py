@@ -53,6 +53,7 @@ log = structlog.get_logger()
 STAGE_BUDGETS_S: dict[Stage, int] = {
     Stage.QUERY_GENERATION: 360,
     Stage.URL_DISCOVERY: 600,
+    Stage.URL_VALIDATION: 300,
     Stage.SCRAPE: 1800,
     Stage.FINALIZE: 60,
 }
@@ -62,6 +63,47 @@ EventSink = Callable[[CollectionEvent], None]
 
 def _noop_sink(_event: CollectionEvent) -> None:  # default no-op
     pass
+
+
+async def _iterate_scrape_results(
+    scraper: object,
+    urls: list[DiscoveredURL],
+    concurrency: int,
+) -> AsyncIterator[ScrapedDoc | Failure]:
+    scrape_batch = getattr(scraper, "scrape_batch", None)
+    if callable(scrape_batch):
+        async for result in scrape_batch(urls, concurrency):
+            yield result
+        return
+
+    sem = asyncio.Semaphore(max(1, concurrency))
+    queue: asyncio.Queue[ScrapedDoc | Failure | None] = asyncio.Queue()
+
+    async def _one(url: DiscoveredURL) -> None:
+        async with sem:
+            result = await scraper.scrape(url)
+        await queue.put(result)
+
+    async def _producer() -> None:
+        try:
+            await asyncio.gather(*[_one(url) for url in urls])
+        finally:
+            await queue.put(None)
+
+    producer = asyncio.create_task(_producer())
+    try:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
+    finally:
+        if not producer.done():
+            producer.cancel()
+            try:
+                await producer
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -93,9 +135,12 @@ async def run_collection(
         return manifest
 
     try:
-        async with asyncio.timeout(int(getattr(config, "global_timeout_s", 1800))):
+        async with asyncio.timeout(int(getattr(config, "global_timeout_s", 5400))):
             queries = await _stage_query_generation(config, adapters, manifest, sink)
             urls = await _stage_url_discovery(config, queries, adapters, manifest, sink)
+            urls = await _stage_url_validation(
+                config, queries, urls, adapters, manifest, sink
+            )
             docs, failures = await _stage_scrape(
                 config, urls, adapters, manifest, sink
             )
@@ -339,6 +384,121 @@ async def _stage_url_discovery(
     return discovered
 
 
+async def _stage_url_validation(
+    config: RunConfig,
+    queries: list[Query],
+    urls: list[DiscoveredURL],
+    adapters: AdapterBundle,
+    manifest: RunManifest,
+    sink: EventSink,
+) -> list[DiscoveredURL]:
+    """
+    LLM-based URL validation. Groups URLs by their source query so the LLM
+    has the query as context, then asks it to keep/drop each candidate based
+    on title+snippet. URLs without any title/snippet bypass the LLM (kept).
+    On LLM failure, defaults to keeping the URL so we never stall the run.
+    """
+    stage = Stage.URL_VALIDATION
+    started = datetime.now(timezone.utc)
+    sink(StageStarted(run_id=config.run_id, stage=stage, at=started))
+
+    if not urls:
+        completed = datetime.now(timezone.utc)
+        stats = StageStats(
+            stage=stage, started_at=started, completed_at=completed,
+            input_count=0, output_count=0, failure_count=0,
+        )
+        manifest.stages[stage] = stats
+        sink(StageCompleted(run_id=config.run_id, stage=stage, stats=stats))
+        return urls
+
+    query_text: dict[str, str] = {q.id: q.text for q in queries}
+
+    # Group by query, but only LLM-validate URLs that actually carry a
+    # title or snippet. Otherwise we have nothing for the LLM to judge.
+    by_query: dict[str, list[DiscoveredURL]] = {}
+    bypass: list[DiscoveredURL] = []
+    for u in urls:
+        if u.title or u.snippet:
+            by_query.setdefault(u.query_id, []).append(u)
+        else:
+            bypass.append(u)
+
+    kept: list[DiscoveredURL] = list(bypass)
+    dropped_count = 0
+
+    async def _validate_group(qid: str, group: list[DiscoveredURL]) -> list[DiscoveredURL]:
+        q = query_text.get(qid, "")
+        items = [(u.url, u.title, u.snippet) for u in group]
+        try:
+            verdicts = await adapters.llm.validate_urls(
+                topic=config.topic, query=q, items=items
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "url_validation.llm_failed",
+                run_id=config.run_id, query=q, error=str(exc),
+            )
+            return group  # keep all on LLM failure
+        if len(verdicts) != len(group):
+            log.warning(
+                "url_validation.length_mismatch",
+                run_id=config.run_id, query=q,
+                expected=len(group), got=len(verdicts),
+            )
+            return group
+        return [u for u, v in zip(group, verdicts) if v]
+
+    try:
+        async with asyncio.timeout(STAGE_BUDGETS_S[stage]):
+            sem = asyncio.Semaphore(8)
+
+            async def _one(qid: str, g: list[DiscoveredURL]) -> list[DiscoveredURL]:
+                async with sem:
+                    return await _validate_group(qid, g)
+
+            results = await asyncio.gather(
+                *[_one(qid, g) for qid, g in by_query.items()]
+            )
+            for group_result, (qid, original) in zip(results, by_query.items()):
+                kept.extend(group_result)
+                dropped_count += len(original) - len(group_result)
+    except asyncio.TimeoutError:
+        log.warning(
+            "url_validation.stage_timeout",
+            run_id=config.run_id, budget_s=STAGE_BUDGETS_S[stage],
+        )
+        # Timeout → fall back to the pre-validation set
+        kept = urls
+        dropped_count = 0
+
+    completed = datetime.now(timezone.utc)
+    stats = StageStats(
+        stage=stage,
+        started_at=started,
+        completed_at=completed,
+        input_count=len(urls),
+        output_count=len(kept),
+        failure_count=dropped_count,
+    )
+    manifest.stages[stage] = stats
+    try:
+        await adapters.storage.save_stage_stats(config.run_id, stats)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("url_validation.stats_save_failed", run_id=config.run_id, error=str(exc))
+
+    sink(StageCompleted(run_id=config.run_id, stage=stage, stats=stats))
+    log.info(
+        "stage.url_validation.done",
+        run_id=config.run_id,
+        input=len(urls),
+        kept=len(kept),
+        dropped=dropped_count,
+        duration_s=(completed - started).total_seconds(),
+    )
+    return kept
+
+
 async def _stage_scrape(
     config: RunConfig,
     urls: list[DiscoveredURL],
@@ -355,82 +515,169 @@ async def _stage_scrape(
     target = config.doc_count
     seen_content: set[str] = set()
 
+    # Crawl4AI errors that suggest the page is reachable but its navigation
+    # stalled (antibot, JS nav loop, browser crash). Static HTML often works.
+    RETRYABLE_ERRORS = {"TimeoutError", "RuntimeError", "TargetClosedError"}
+    CURL_RETRYABLE_ERRORS = RETRYABLE_ERRORS | {
+        "ConnectError",
+        "HTTPError",
+        "ReadTimeout",
+        "RemoteProtocolError",
+    }
+    url_by_target = {u.url: u for u in urls}
+    curl_retry_urls: list[DiscoveredURL] = []
+    curl_retry_failures: dict[str, Failure] = {}
+
+    async def _record_failure(result: Failure) -> None:
+        failures.append(result)
+        try:
+            await adapters.storage.save_failure(result)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "scrape.save_failure_failed",
+                run_id=config.run_id,
+                error=str(exc),
+            )
+        sink(
+            DocFailed(
+                run_id=config.run_id,
+                url=result.target,
+                error_type=result.error_type,
+            )
+        )
+
+    async def _record_doc(result: ScrapedDoc) -> None:
+        if result.content_hash in seen_content:
+            return
+        if await adapters.storage.content_hash_seen(
+            config.run_id, result.content_hash
+        ):
+            seen_content.add(result.content_hash)
+            return
+        seen_content.add(result.content_hash)
+
+        try:
+            path = await adapters.filesystem.write_doc(result)
+            result = result.model_copy(update={"path": path})
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "scrape.fs_write_failed",
+                run_id=config.run_id,
+                error=str(exc),
+            )
+            return
+
+        try:
+            await adapters.storage.save_doc(result)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "scrape.save_doc_failed",
+                run_id=config.run_id,
+                error=str(exc),
+            )
+            return
+
+        docs.append(result)
+        sink(
+            DocScraped(
+                run_id=config.run_id,
+                url=result.url,
+                token_count=result.token_count,
+            )
+        )
+
+        if len(docs) % CHECKPOINT_INTERVAL_DOCS == 0:
+            log.debug("scrape.checkpoint", run_id=config.run_id, docs=len(docs))
+
     async def _run_scrape() -> None:
-        # Use scrape_batch if available for streaming results
-        batcher = adapters.scraper
-        async for result in batcher.scrape_batch(urls, config.scraper_concurrency):
+        async for result in _iterate_scrape_results(
+            adapters.scraper,
+            urls,
+            config.scraper_concurrency,
+        ):
             if isinstance(result, Failure):
-                failures.append(result)
-                try:
-                    await adapters.storage.save_failure(result)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning(
-                        "scrape.save_failure_failed",
+                if (
+                    adapters.fallback_scraper is not None
+                    and result.error_type in RETRYABLE_ERRORS
+                    and (orig := url_by_target.get(result.target)) is not None
+                ):
+                    log.info(
+                        "scrape.fallback_retry",
                         run_id=config.run_id,
-                        error=str(exc),
+                        url=result.target,
+                        primary_error=result.error_type,
                     )
-                sink(
-                    DocFailed(
+                    fb = await adapters.fallback_scraper.scrape(orig)
+                    if not isinstance(fb, Failure):
+                        result = fb  # success — fall through to the happy path
+                    else:
+                        log.info(
+                            "scrape.fallback_also_failed",
+                            url=result.target,
+                            fallback_error=fb.error_type,
+                        )
+
+            if isinstance(result, Failure):
+                if (
+                    adapters.curl_fallback_scraper is not None
+                    and result.error_type in CURL_RETRYABLE_ERRORS
+                    and (orig := url_by_target.get(result.target)) is not None
+                    and result.target not in curl_retry_failures
+                ):
+                    curl_retry_urls.append(orig)
+                    curl_retry_failures[result.target] = result
+                    log.info(
+                        "scrape.curl_fallback_queued",
                         run_id=config.run_id,
                         url=result.target,
                         error_type=result.error_type,
                     )
-                )
+                    continue
+                await _record_failure(result)
                 continue
 
-            # Exact-content dedup
-            if result.content_hash in seen_content:
-                continue
-            if await adapters.storage.content_hash_seen(
-                config.run_id, result.content_hash
-            ):
-                seen_content.add(result.content_hash)
-                continue
-            seen_content.add(result.content_hash)
-
-            # Write to filesystem (updates path field)
-            try:
-                path = await adapters.filesystem.write_doc(result)
-                result = result.model_copy(update={"path": path})
-            except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "scrape.fs_write_failed",
-                    run_id=config.run_id,
-                    error=str(exc),
-                )
-                continue
-
-            # Persist DB row
-            try:
-                await adapters.storage.save_doc(result)
-            except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "scrape.save_doc_failed",
-                    run_id=config.run_id,
-                    error=str(exc),
-                )
-                continue
-
-            docs.append(result)
-            sink(
-                DocScraped(
-                    run_id=config.run_id,
-                    url=result.url,
-                    token_count=result.token_count,
-                )
-            )
-
-            # Checkpoint every N docs
-            if len(docs) % CHECKPOINT_INTERVAL_DOCS == 0:
-                log.debug("scrape.checkpoint", run_id=config.run_id, docs=len(docs))
-
+            await _record_doc(result)
             if len(docs) >= target:
                 break
 
+        if (
+            len(docs) >= target
+            or adapters.curl_fallback_scraper is None
+            or not curl_retry_urls
+        ):
+            return
+
+        log.info(
+            "scrape.curl_fallback_batch_start",
+            run_id=config.run_id,
+            queued=len(curl_retry_urls),
+        )
+        async for result in _iterate_scrape_results(
+            adapters.curl_fallback_scraper,
+            curl_retry_urls,
+            config.scraper_concurrency,
+        ):
+            if isinstance(result, Failure):
+                original_failure = curl_retry_failures.pop(result.target, result)
+                await _record_failure(original_failure)
+                continue
+
+            await _record_doc(result)
+            curl_retry_failures.pop(result.url, None)
+            if len(docs) >= target:
+                break
+
+        if len(docs) >= target:
+            curl_retry_failures.clear()
+            return
+
+        for original_failure in curl_retry_failures.values():
+            await _record_failure(original_failure)
+        curl_retry_failures.clear()
+
     try:
         async with asyncio.timeout(STAGE_BUDGETS_S[stage]):
-            async with adapters.scraper:
-                await _run_scrape()
+            await _run_scrape()
     except asyncio.TimeoutError:
         log.warning(
             "scrape.stage_timeout",

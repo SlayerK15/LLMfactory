@@ -30,6 +30,14 @@ class FakeLLM:
     async def score_relevance(self, queries: list[str], topic: str) -> list[float]:
         return [0.8] * len(queries)
 
+    async def validate_urls(
+        self,
+        topic: str,
+        query: str,
+        items: list[tuple[str, str | None, str | None]],
+    ) -> list[bool]:
+        return [True] * len(items)
+
     async def health_check(self) -> bool:
         return True
 
@@ -105,6 +113,32 @@ class FakeScraper:
 
     async def __aexit__(self, exc_type, exc, tb):
         return False
+
+
+class FakeFallbackScraper:
+    """Returns a pre-baked response — used to exercise _stage_scrape's retry."""
+
+    def __init__(self, response: ScrapedDoc | Failure | None = None) -> None:
+        self._response = response
+        self.call_count = 0
+
+    async def scrape(self, url: DiscoveredURL) -> ScrapedDoc | Failure:
+        self.call_count += 1
+        if self._response is not None:
+            return self._response
+        return ScrapedDoc(
+            run_id=url.run_id,
+            url_id=url.id,
+            url=url.url,
+            markdown=f"# fallback doc for {url.url}\n\n" + ("x " * 100),
+            content_hash=ScrapedDoc.compute_content_hash(f"fallback-{url.url}"),
+            token_count=100,
+            extraction_confidence=0.6,
+        )
+
+    async def scrape_batch(self, urls, concurrency):
+        for url in urls:
+            yield await self.scrape(url)
 
 
 class FakeFilesystem:

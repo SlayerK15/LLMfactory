@@ -33,10 +33,11 @@ class RunConfig(BaseModel):
     max_queries: int = 600
     relevance_threshold: float = 0.5
     search_backends: list[SearchBackend] = Field(
-        default_factory=lambda: [SearchBackend.CC_CDX, SearchBackend.SEARXNG]
+        default_factory=lambda: [SearchBackend.SEARXNG]
     )
     scraper_concurrency: int = 40
     per_url_timeout_s: int = 30
+    global_timeout_s: int = 5400
     created_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -67,6 +68,10 @@ class DiscoveredURL(BaseModel):
     source_backend: SearchBackend
     status: URLStatus = URLStatus.PENDING
     discovered_at: datetime = Field(default_factory=_utcnow)
+    # Populated by search adapters when available. Used by the LLM URL
+    # validator; not persisted to the DB.
+    title: str | None = None
+    snippet: str | None = None
 
     @computed_field  # type: ignore[misc]
     @property
@@ -167,3 +172,5 @@ class AdapterBundle(BaseModel):
     scraper: object
     storage: object
     filesystem: object
+    fallback_scraper: object | None = None
+    curl_fallback_scraper: object | None = None

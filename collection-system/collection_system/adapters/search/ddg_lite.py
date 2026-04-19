@@ -14,7 +14,7 @@ import httpx
 import structlog
 
 from collection_system.adapters.search.base import extract_domain, normalize_url
-from collection_system.adapters.search.cc_cdx import BLOCKED_DOMAINS
+from collection_system.adapters.search.blocklist import is_blocked
 from collection_system.core.constants import SearchBackend, URLStatus
 from collection_system.core.errors import SearchError
 from collection_system.core.models import DiscoveredURL, Query
@@ -107,7 +107,7 @@ class DDGLiteAdapter:
             if normed in seen:
                 continue
             domain = extract_domain(normed)
-            if domain in BLOCKED_DOMAINS or domain.endswith("duckduckgo.com"):
+            if domain.endswith("duckduckgo.com") or is_blocked(domain, normed):
                 continue
             seen.add(normed)
             results.append(

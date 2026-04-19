@@ -4,6 +4,7 @@ from enum import StrEnum
 class Stage(StrEnum):
     QUERY_GENERATION = "QUERY_GENERATION"
     URL_DISCOVERY = "URL_DISCOVERY"
+    URL_VALIDATION = "URL_VALIDATION"
     SCRAPE = "SCRAPE"
     FINALIZE = "FINALIZE"
 

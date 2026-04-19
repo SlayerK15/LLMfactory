@@ -12,7 +12,7 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-collection}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-collection} -d ${POSTGRES_DB:-collection}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -22,6 +22,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - ./searxng/limiter.toml:/etc/searxng/limiter.toml:ro
     ports:
       - "8888:8080"
     environment:

@@ -20,12 +20,20 @@ import structlog
 sse_log_queue: contextvars.ContextVar = contextvars.ContextVar(
     "sse_log_queue", default=None
 )
+_bridge_installed = False
+
+
+def _enqueue_line(line: str) -> None:
+    queue = sse_log_queue.get()
+    if queue is None:
+        return
+    try:
+        queue.put_nowait(line)
+    except Exception:
+        pass
 
 
 def _forward_to_sse(logger, method_name, event_dict):
-    queue = sse_log_queue.get()
-    if queue is None:
-        return event_dict
     level = event_dict.get("level", method_name)
     event = event_dict.get("event", "")
     skip = {"event", "level", "timestamp", "logger"}
@@ -37,14 +45,27 @@ def _forward_to_sse(logger, method_name, event_dict):
     line = f"[{level:<5}] {event}"
     if fields:
         line += "  " + " ".join(fields)
-    try:
-        queue.put_nowait(line)
-    except Exception:
-        pass
+    _enqueue_line(line)
     return event_dict
 
 
+class _Crawl4AILogHandler(logging.Handler):
+    """Forward stdlib Crawl4AI logs into the active SSE queue."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if not record.name.startswith("crawl4ai"):
+            return
+        level = record.levelname.lower()
+        line = f"[{level:<5}] {record.name}"
+        message = record.getMessage()
+        if message:
+            line += f"  {message}"
+        _enqueue_line(line)
+
+
 def configure_logging(level: str = "INFO") -> None:
+    global _bridge_installed
+
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
@@ -60,3 +81,13 @@ def configure_logging(level: str = "INFO") -> None:
         logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
         cache_logger_on_first_use=True,
     )
+
+    if _bridge_installed:
+        return
+
+    handler = _Crawl4AILogHandler()
+    handler.setLevel(getattr(logging, level.upper(), logging.INFO))
+    crawl4ai_logger = logging.getLogger("crawl4ai")
+    crawl4ai_logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    crawl4ai_logger.addHandler(handler)
+    _bridge_installed = True

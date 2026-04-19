@@ -5,6 +5,8 @@ LLM-dependent nodes take an explicit `llm` param; graph.py wraps them in closure
 """
 from __future__ import annotations
 
+import asyncio
+
 import structlog
 
 from collection_system.agents.state import AgentState
@@ -14,6 +16,7 @@ from collection_system.core.ports import LLMPort
 log = structlog.get_logger()
 
 SCORE_BATCH_SIZE = 20
+EXPAND_CONCURRENCY = 16
 
 
 async def expand_node(state: AgentState, llm: LLMPort) -> dict:
@@ -26,16 +29,23 @@ async def expand_node(state: AgentState, llm: LLMPort) -> dict:
     topic = state["topic"]
     max_queries = state["max_queries"]
     all_queries = list(state["all_queries"])
+    remaining_slots = max(0, max_queries - len(all_queries))
+    parents_to_expand = pending[:remaining_slots]
+    sem = asyncio.Semaphore(EXPAND_CONCURRENCY)
+
+    async def _expand_parent(parent_query: Query) -> list[str]:
+        async with sem:
+            return await llm.expand_topic(
+                topic=topic,
+                parent=parent_query.text,
+                depth=depth,
+            )
 
     new_queries: list[Query] = []
-    for parent_query in pending:
-        if len(all_queries) + len(new_queries) >= max_queries:
-            break
-        children_texts = await llm.expand_topic(
-            topic=topic,
-            parent=parent_query.text,
-            depth=depth,
-        )
+    child_batches = await asyncio.gather(
+        *[_expand_parent(parent_query) for parent_query in parents_to_expand]
+    )
+    for parent_query, children_texts in zip(parents_to_expand, child_batches):
         for text in children_texts:
             if len(all_queries) + len(new_queries) >= max_queries:
                 break

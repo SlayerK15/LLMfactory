@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import anyio
 import pytest
 from fastapi.testclient import TestClient
 from sse_starlette.sse import AppStatus
 
-from orchestrator.app import create_app
+from orchestrator.app import _pump_with_logs, create_app
+from orchestrator.events import OrchestratorEvent, Stage
 
 
 @pytest.fixture(autouse=True)
@@ -130,3 +132,37 @@ def test_invalid_output_format_rejected(client: TestClient):
         },
     )
     assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_pump_with_logs_includes_crawl4ai_stdlib_logs():
+    async def fake_pipeline():
+        logging.getLogger("crawl4ai.browser").info("launched browser")
+        yield OrchestratorEvent(
+            kind="stage_started",
+            stage=Stage.INIT,
+            run_id="test-run",
+            message="booting",
+        )
+        yield OrchestratorEvent(
+            kind="pipeline_done",
+            stage=Stage.DONE,
+            run_id="test-run",
+            message="done",
+            data={},
+        )
+
+    items = []
+    async for item in _pump_with_logs(fake_pipeline()):
+        items.append(item)
+
+    log_payloads = [
+        json.loads(item["data"])
+        for item in items
+        if item["event"] == "log"
+    ]
+    assert any(
+        "crawl4ai.browser" in payload["message"]
+        and "launched browser" in payload["message"]
+        for payload in log_payloads
+    )

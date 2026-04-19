@@ -48,8 +48,13 @@ DEFAULT_SEED_DOMAINS: tuple[str, ...] = (
     "aws.amazon.com",
 )
 
-# Permanent noise domains we never want scraped.
-BLOCKED_DOMAINS = frozenset(["pinterest.com", "facebook.com", "twitter.com", "x.com"])
+# Permanent noise domains — moved to blocklist.py.  Re-exported here for
+# backwards-compatibility with callers that imported BLOCKED_DOMAINS from
+# this module before the shared blocklist existed.
+from collection_system.adapters.search.blocklist import (  # noqa: E402
+    BLOCKED_DOMAINS,
+    is_blocked,
+)
 
 
 def _slugify(text: str) -> str:
@@ -75,11 +80,16 @@ class CCDXAdapter:
         seed_domains: tuple[str, ...] | list[str] = DEFAULT_SEED_DOMAINS,
         max_per_query: int = 20,
         seeds_per_query: int = 3,
+        seed_timeout_s: float = 10.0,
+        short_circuit_after_failures: int = 8,
     ) -> None:
         self.index = index
         self.seed_domains = tuple(seed_domains)
         self.max_per_query = max_per_query
         self.seeds_per_query = seeds_per_query
+        self._seed_timeout_s = seed_timeout_s
+        self._short_circuit_after = short_circuit_after_failures
+        self._consecutive_failures = 0
         self._cdx: Any = None  # lazy init — cdx_toolkit import is expensive
 
     @property
@@ -136,15 +146,38 @@ class CCDXAdapter:
         return found
 
     async def discover_urls(self, query: Query, limit: int = 20) -> list[DiscoveredURL]:
+        # Short-circuit: if the index has been failing repeatedly this run,
+        # stop spawning threads that will only block the executor pool.
+        if self._consecutive_failures >= self._short_circuit_after:
+            log.debug(
+                "cc_cdx.short_circuited",
+                query=query.text,
+                failures=self._consecutive_failures,
+            )
+            return []
+
         slug = _slugify(query.text)
         keywords = _keywords(query.text)
         seeds = self._pick_seeds(query.id)
         per_seed = max(5, limit * 2)
 
-        tasks = [
-            asyncio.to_thread(self._iter_seed_blocking, seed, keywords, slug, per_seed)
-            for seed in seeds
-        ]
+        async def _run_seed(seed: str) -> list[str]:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._iter_seed_blocking, seed, keywords, slug, per_seed
+                    ),
+                    timeout=self._seed_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "cc_cdx.seed_timeout",
+                    seed=seed,
+                    timeout_s=self._seed_timeout_s,
+                )
+                return []
+
+        tasks = [_run_seed(seed) for seed in seeds]
         try:
             batches = await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as exc:  # noqa: BLE001
@@ -152,16 +185,19 @@ class CCDXAdapter:
 
         seen: set[str] = set()
         results: list[DiscoveredURL] = []
+        all_empty = True
         for batch in batches:
             if isinstance(batch, BaseException):
                 log.warning("cc_cdx.seed_failed", error=str(batch))
                 continue
+            if batch:
+                all_empty = False
             for raw_url in batch:
                 normed = normalize_url(raw_url)
                 if normed in seen:
                     continue
                 domain = extract_domain(normed)
-                if domain in BLOCKED_DOMAINS:
+                if is_blocked(domain, normed):
                     continue
                 seen.add(normed)
                 results.append(
@@ -178,6 +214,11 @@ class CCDXAdapter:
                     break
             if len(results) >= limit:
                 break
+
+        if all_empty:
+            self._consecutive_failures += 1
+        else:
+            self._consecutive_failures = 0
 
         log.info(
             "cc_cdx.discover_urls",

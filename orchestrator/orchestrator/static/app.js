@@ -61,9 +61,47 @@ function setStatus(state, label) {
 }
 
 // --- Log output ---------------------------------------------------------------
+function classifyLogLine(line) {
+  const classes = ["log-line"];
+  const normalized = line.toLowerCase();
+
+  if (normalized.includes("[error") || normalized.includes(" error:")) classes.push("level-error");
+  else if (normalized.includes("[warn")) classes.push("level-warn");
+  else if (normalized.includes("[debug")) classes.push("level-debug");
+  else if (normalized.includes("[critical")) classes.push("level-critical");
+  else classes.push("level-info");
+
+  if (normalized.includes("crawl4ai")) classes.push("source-crawl4ai");
+  if (
+    normalized.includes("run_query_agent")
+    || normalized.includes("expand_node")
+    || normalized.includes("score_node")
+    || normalized.includes("filter_node")
+  ) classes.push("source-query");
+  if (
+    normalized.includes("searxng")
+    || normalized.includes("cc_cdx")
+    || normalized.includes("ddg")
+    || normalized.includes("discover_urls")
+  ) classes.push("source-search");
+  if (normalized.includes("forge") || normalized.includes("lancedb") || normalized.includes("embed")) {
+    classes.push("source-forge");
+  }
+  if (normalized.includes("clean") || normalized.includes("perplexity")) classes.push("source-clean");
+  if (
+    normalized.includes("pipeline")
+    || normalized.includes("stage.")
+    || normalized.includes("stage_")
+    || normalized.includes("orchestrator")
+  ) classes.push("source-pipeline");
+
+  return classes;
+}
+
 function append(line, cls) {
   const span = document.createElement("span");
-  if (cls) span.className = cls;
+  if (Array.isArray(cls)) span.className = cls.join(" ");
+  else if (cls) span.className = cls;
   const ts = new Date().toLocaleTimeString([], { hour12: false });
   const tsEl = document.createElement("span");
   tsEl.className = "ts";
@@ -204,7 +242,7 @@ function handleRawEvent(raw) {
   if (run_id && !currentRunId) currentRunId = run_id;
 
   if (kind === "log") {
-    append(message || "", "log-line");
+    append(message || "", classifyLogLine(message || ""));
     return;
   }
 

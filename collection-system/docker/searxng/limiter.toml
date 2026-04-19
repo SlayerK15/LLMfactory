@@ -1,0 +1,2 @@
+# Limiter is disabled in settings.yml; this file exists to avoid
+# SearXNG startup warnings about a missing /etc/searxng/limiter.toml.
