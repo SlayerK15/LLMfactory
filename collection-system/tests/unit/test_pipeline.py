@@ -96,6 +96,36 @@ async def test_pipeline_handles_scraper_failures(
 
 
 @pytest.mark.asyncio
+async def test_pipeline_counts_url_discovery_failures(
+    run_config, fake_llm, fake_scraper, fake_storage, fake_filesystem
+):
+    from collection_system.core.models import AdapterBundle
+
+    class FailingSearch:
+        async def discover_urls(self, query, limit=20):  # noqa: ANN001
+            raise RuntimeError("search down")
+
+        async def health_check(self) -> bool:
+            return False
+
+    bundle = AdapterBundle(
+        llm=fake_llm,
+        search=FailingSearch(),
+        scraper=fake_scraper,
+        storage=fake_storage,
+        filesystem=fake_filesystem,
+    )
+    run_config.doc_count = 3
+    run_config.max_queries = 5
+    run_config.max_depth = 1
+
+    manifest = await run_collection(run_config, bundle)
+
+    assert manifest.status == RunStatus.COMPLETED
+    assert manifest.stages[Stage.URL_DISCOVERY].failure_count > 0
+
+
+@pytest.mark.asyncio
 async def test_pipeline_content_hash_dedup(run_config, adapter_bundle, fake_storage):
     """Duplicate content (same content_hash) should not be stored twice."""
     run_config.doc_count = 10

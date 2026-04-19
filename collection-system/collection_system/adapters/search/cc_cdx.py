@@ -63,6 +63,20 @@ def _keywords(text: str) -> list[str]:
     return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) > 3]
 
 
+def _url_relevance_score(url: str, *, slug: str, keywords: list[str]) -> int:
+    """Heuristic score for URL relevance to a query."""
+    url_lower = url.lower()
+    score = 0
+    if slug and slug in url_lower:
+        score += 4
+    kw_hits = sum(1 for k in keywords if k in url_lower)
+    score += min(kw_hits, 3)
+    # Prefer likely article/docs pages over homepages.
+    if url_lower.count("/") >= 4:
+        score += 1
+    return score
+
+
 class CCDXAdapter:
     """
     Queries the Common Crawl CDX API via cdx-toolkit.
@@ -116,24 +130,28 @@ class CCDXAdapter:
     ) -> list[str]:
         """Synchronous CDX iter — run in asyncio.to_thread."""
         client = self._get_client()
-        found: list[str] = []
+        matched: list[tuple[int, str]] = []
+        fallback: list[str] = []
         try:
             for obj in client.iter(f"{seed}/*", limit=limit):
                 url = obj.get("url", "") if hasattr(obj, "get") else str(obj)
                 if not url:
                     continue
-                url_lower = url.lower()
-                # Relevance filter: either slug appears or ≥2 keywords appear
-                kw_hits = sum(1 for k in keywords if k in url_lower)
-                if slug and slug in url_lower:
-                    found.append(url)
-                elif kw_hits >= 2:
-                    found.append(url)
-                if len(found) >= limit:
+                score = _url_relevance_score(url, slug=slug, keywords=keywords)
+                if score > 0:
+                    matched.append((score, url))
+                elif len(fallback) < limit:
+                    # Keep a small fallback pool so broad/abstract topics still yield URLs.
+                    fallback.append(url)
+                if len(matched) >= limit * 2:
                     break
         except Exception as exc:  # noqa: BLE001 — CDX client raises varied types
             log.warning("cc_cdx.iter_failed", seed=seed, error=str(exc))
-        return found
+        matched.sort(key=lambda item: item[0], reverse=True)
+        ranked = [u for _, u in matched[:limit]]
+        if len(ranked) < limit:
+            ranked.extend(fallback[: limit - len(ranked)])
+        return ranked[:limit]
 
     async def discover_urls(self, query: Query, limit: int = 20) -> list[DiscoveredURL]:
         slug = _slugify(query.text)

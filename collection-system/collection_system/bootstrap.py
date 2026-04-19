@@ -8,6 +8,8 @@ from __future__ import annotations
 from collection_system.adapters.llm.groq_adapter import GroqAdapter
 from collection_system.adapters.llm.ollama_adapter import OllamaAdapter
 from collection_system.adapters.scraper.crawl4ai_adapter import Crawl4AIAdapter
+from collection_system.adapters.scraper.httpx_fallback import HttpxFallbackAdapter
+from collection_system.adapters.scraper.resilient import ResilientScraperAdapter
 from collection_system.adapters.search.cc_cdx import CCDXAdapter
 from collection_system.adapters.search.composite import CompositeSearchAdapter
 from collection_system.adapters.search.ddg_lite import DDGLiteAdapter
@@ -53,11 +55,13 @@ def build_search(settings: Settings, enabled: list[SearchBackend]):
     return CompositeSearchAdapter(backends=backends)
 
 
-def build_scraper(settings: Settings) -> Crawl4AIAdapter:
-    return Crawl4AIAdapter(
+def build_scraper(settings: Settings) -> ResilientScraperAdapter:
+    primary = Crawl4AIAdapter(
         concurrency=settings.scraper_concurrency,
         per_url_timeout_s=settings.per_url_timeout_s,
     )
+    fallback = HttpxFallbackAdapter(timeout_s=settings.per_url_timeout_s)
+    return ResilientScraperAdapter(primary=primary, fallback=fallback)
 
 
 def build_storage() -> PostgresStorageAdapter:

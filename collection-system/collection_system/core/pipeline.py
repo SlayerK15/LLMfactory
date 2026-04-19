@@ -268,10 +268,11 @@ async def _stage_url_discovery(
             # Fan out across queries — composite adapter handles backend-level fan-out
             sem = asyncio.Semaphore(32)  # allow high concurrency — backends have their own rate limits
 
-            async def _one(q: Query) -> list[DiscoveredURL]:
+            async def _one(q: Query) -> tuple[list[DiscoveredURL], bool]:
                 async with sem:
                     try:
-                        return await adapters.search.discover_urls(q, limit=per_query)
+                        urls = await adapters.search.discover_urls(q, limit=per_query)
+                        return urls, False
                     except Exception as exc:  # noqa: BLE001
                         log.warning(
                             "url_discovery.query_failed",
@@ -279,14 +280,16 @@ async def _stage_url_discovery(
                             query=q.text,
                             error=str(exc),
                         )
-                        return []
+                        return [], True
 
             batches = await asyncio.gather(*[_one(q) for q in queries])
     except asyncio.TimeoutError as exc:
         raise PipelineTimeoutError(stage.value, STAGE_BUDGETS_S[stage]) from exc
 
     # Dedup + persist
-    for batch in batches:
+    for batch, query_failed in batches:
+        if query_failed:
+            failure_count += 1
         backend_counts: dict[str, int] = {}
         for du in batch:
             if du.url_hash in unique_hashes:
