@@ -80,6 +80,34 @@ def _save_report(report: CleaningReport, config: CleaningConfig) -> None:
     log.info("pipeline.report_saved", path=str(report_path))
 
 
+def _enforce_min_keep_ratio(
+    stage: str,
+    before: list[DocRecord],
+    after: list[DocRecord],
+    input_docs: int,
+    config: CleaningConfig,
+) -> list[DocRecord]:
+    """
+    Avoid catastrophic stage drops by enforcing a minimum end-to-end keep ratio.
+    If a stage would take the run below `min_cleaning_keep_ratio`, keep the
+    pre-stage set instead and continue.
+    """
+    if input_docs <= 0:
+        return after
+    min_docs = max(1, int(input_docs * config.min_cleaning_keep_ratio))
+    if len(after) >= min_docs:
+        return after
+    log.warning(
+        "pipeline.stage_overdrop_guardrail",
+        stage=stage,
+        before=len(before),
+        after=len(after),
+        min_docs=min_docs,
+        min_keep_ratio=config.min_cleaning_keep_ratio,
+    )
+    return before
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -113,25 +141,35 @@ async def run_cleaning(config: CleaningConfig) -> CleaningReport:
     n_input = len(docs)
 
     # 2. Near-dedup
+    docs_before = docs
     docs = await asyncio.to_thread(near_dedup.run, docs, config)
+    docs = _enforce_min_keep_ratio("near_dedup", docs_before, docs, n_input, config)
     n_after_near_dedup = len(docs)
 
     # 3. Language filter
+    docs_before = docs
     docs = await asyncio.to_thread(lang_filter.run, docs, config)
+    docs = _enforce_min_keep_ratio("lang_filter", docs_before, docs, n_input, config)
     n_after_lang = len(docs)
 
     # 4. Gopher heuristics
+    docs_before = docs
     docs = await asyncio.to_thread(gopher.run, docs, config)
+    docs = _enforce_min_keep_ratio("gopher", docs_before, docs, n_input, config)
     n_after_gopher = len(docs)
 
     # 5. Perplexity filter (model loaded in thread to avoid blocking event loop)
     if config.enable_perplexity and docs:
+        docs_before = docs
         docs = await asyncio.to_thread(perplexity.run, docs, config)
+        docs = _enforce_min_keep_ratio("perplexity", docs_before, docs, n_input, config)
     n_after_perplexity = len(docs)
 
     # 6. Relevance filter
     if config.enable_relevance and docs:
+        docs_before = docs
         docs = await asyncio.to_thread(relevance.run, docs, config)
+        docs = _enforce_min_keep_ratio("relevance", docs_before, docs, n_input, config)
     n_after_relevance = len(docs)
 
     # 7. Trafilatura re-extraction (async — makes HTTP calls)

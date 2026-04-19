@@ -62,6 +62,7 @@ class CleaningConfig(BaseModel):
     enable_perplexity: bool = True
     enable_relevance: bool = True
     enable_trafilatura: bool = True
+    min_cleaning_keep_ratio: float = Field(default=0.75, ge=0.0, le=1.0)
 
     # near-dup
     near_dup_threshold: float = Field(default=0.8, ge=0.0, le=1.0)

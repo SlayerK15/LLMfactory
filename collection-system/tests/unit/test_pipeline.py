@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from collection_system.core.constants import RunStatus, Stage
+from collection_system.core.models import DiscoveredURL
 from collection_system.core.events import (
     DocScraped,
     QueriesGenerated,
@@ -12,7 +13,12 @@ from collection_system.core.events import (
     StageCompleted,
     URLsDiscovered,
 )
-from collection_system.core.pipeline import run_collection, run_collection_streaming
+from collection_system.core.pipeline import (
+    _query_budget_for_doc_target,
+    URLS_PER_DOC_TARGET,
+    run_collection,
+    run_collection_streaming,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -146,3 +152,112 @@ async def test_streaming_docscraped_events_match_doc_count(
             doc_events += 1
 
     assert doc_events == len(fake_storage.docs)
+
+
+@pytest.mark.asyncio
+async def test_url_discovery_retries_with_simplified_query(
+    run_config, fake_llm, fake_storage, fake_filesystem, fake_scraper
+):
+    from collection_system.core.constants import SearchBackend
+    from collection_system.core.models import AdapterBundle, Query
+
+    class VerboseQuerySearch:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        @property
+        def name(self) -> str:
+            return "verbose_query_search"
+
+        @property
+        def rate_limit(self):
+            from collection_system.core.ports import RateLimit
+
+            return RateLimit(requests=100, per_seconds=1.0)
+
+        async def discover_urls(self, query: Query, limit: int = 20) -> list[DiscoveredURL]:
+            self.calls.append(query.text)
+            if "explain" in query.text.lower():
+                return []
+            return [
+                DiscoveredURL(
+                    run_id=query.run_id,
+                    query_id=query.id,
+                    url=f"https://example.com/{query.id}/0",
+                    domain="example.com",
+                    source_backend=SearchBackend.SEARXNG,
+                )
+            ]
+
+        async def health_check(self) -> bool:
+            return True
+
+    search = VerboseQuerySearch()
+    bundle = AdapterBundle(
+        llm=fake_llm,
+        search=search,
+        scraper=fake_scraper,
+        storage=fake_storage,
+        filesystem=fake_filesystem,
+    )
+
+    run_config.topic = "Explain practical AI safety strategies for startups"
+    run_config.max_queries = 1
+    run_config.max_depth = 0
+    run_config.doc_count = 1
+
+    manifest = await run_collection(run_config, bundle)
+
+    assert manifest.status == RunStatus.COMPLETED
+    assert len(fake_storage.urls) > 0
+    assert len(search.calls) >= 2
+
+
+def test_query_budget_scales_with_doc_target():
+    assert _query_budget_for_doc_target(doc_count=80, configured_max=600) == 40
+    assert _query_budget_for_doc_target(doc_count=1200, configured_max=600) == 300
+    assert _query_budget_for_doc_target(doc_count=4000, configured_max=600) == 600
+    assert _query_budget_for_doc_target(doc_count=4000, configured_max=250) == 250
+
+
+@pytest.mark.asyncio
+async def test_url_validation_guardrail_prevents_overdrop(
+    run_config, fake_search, fake_storage, fake_filesystem, fake_scraper
+):
+    from collection_system.core.models import AdapterBundle
+
+    class DropAllLLM:
+        async def expand_topic(self, topic: str, parent: str | None, depth: int) -> list[str]:
+            return [topic]
+
+        async def score_relevance(self, queries: list[str], topic: str) -> list[float]:
+            return [1.0] * len(queries)
+
+        async def validate_urls(
+            self,
+            topic: str,
+            query: str,
+            items: list[tuple[str, str | None, str | None]],
+        ) -> list[bool]:
+            return [False] * len(items)
+
+    bundle = AdapterBundle(
+        llm=DropAllLLM(),
+        search=fake_search,
+        scraper=fake_scraper,
+        storage=fake_storage,
+        filesystem=fake_filesystem,
+    )
+    run_config.doc_count = 50
+    run_config.max_queries = 3
+    run_config.max_depth = 1
+
+    manifest = await run_collection(run_config, bundle)
+
+    assert manifest.status == RunStatus.COMPLETED
+    assert manifest.stages[Stage.URL_DISCOVERY].output_count >= 1
+    assert manifest.stages[Stage.URL_VALIDATION].output_count == manifest.stages[Stage.URL_DISCOVERY].output_count
+
+
+def test_url_target_ratio_is_one_to_five():
+    assert URLS_PER_DOC_TARGET == 5

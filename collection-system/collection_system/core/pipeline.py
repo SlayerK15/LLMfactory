@@ -12,6 +12,7 @@ Design contract:
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from datetime import datetime, timezone
 from typing import AsyncIterator, Callable
@@ -57,12 +58,67 @@ STAGE_BUDGETS_S: dict[Stage, int] = {
     Stage.SCRAPE: 1800,
     Stage.FINALIZE: 60,
 }
+URLS_PER_DOC_TARGET = 5
 
 EventSink = Callable[[CollectionEvent], None]
 
 
 def _noop_sink(_event: CollectionEvent) -> None:  # default no-op
     pass
+
+
+def _query_budget_for_doc_target(doc_count: int, configured_max: int) -> int:
+    """
+    Tune query breadth to the requested document target.
+    More docs need more breadth, but unbounded query fan-out tanks per-query
+    URL yield and slows discovery/scraping.
+    """
+    # Heuristic: ~1 query per 4 target docs, bounded to keep generation stable.
+    target_driven = max(40, doc_count // 4)
+    return max(1, min(configured_max, target_driven))
+
+
+_QUERY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "into",
+    "is",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "to",
+    "what",
+    "when",
+    "where",
+    "which",
+    "with",
+}
+
+
+def _simplify_query_text(text: str, max_terms: int = 6) -> str:
+    """
+    Build a compact search query from a verbose LLM expansion.
+    Keeps informative tokens, drops common stopwords, and preserves order.
+    """
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    if not tokens:
+        return text.strip()
+    compact = [t for t in tokens if len(t) > 2 and t not in _QUERY_STOPWORDS]
+    if not compact:
+        compact = tokens
+    return " ".join(compact[:max_terms]).strip() or text.strip()
 
 
 async def _iterate_scrape_results(
@@ -150,33 +206,45 @@ async def run_collection(
     except PipelineTimeoutError as exc:
         manifest.status = RunStatus.FAILED
         manifest.error_msg = str(exc)
-        await adapters.storage.update_run_status(
-            config.run_id, RunStatus.FAILED, error_msg=str(exc)
-        )
+        try:
+            await adapters.storage.update_run_status(
+                config.run_id, RunStatus.FAILED, error_msg=str(exc)
+            )
+        except Exception as status_exc:  # noqa: BLE001
+            log.warning("pipeline.update_status_failed", run_id=config.run_id, error=str(status_exc))
         sink(RunFailed(run_id=config.run_id, error=str(exc)))
         return manifest
     except asyncio.TimeoutError:
         msg = "Global pipeline timeout exceeded"
         manifest.status = RunStatus.FAILED
         manifest.error_msg = msg
-        await adapters.storage.update_run_status(
-            config.run_id, RunStatus.FAILED, error_msg=msg
-        )
+        try:
+            await adapters.storage.update_run_status(
+                config.run_id, RunStatus.FAILED, error_msg=msg
+            )
+        except Exception as status_exc:  # noqa: BLE001
+            log.warning("pipeline.update_status_failed", run_id=config.run_id, error=str(status_exc))
         sink(RunFailed(run_id=config.run_id, error=msg))
         return manifest
     except Exception as exc:  # noqa: BLE001
         log.exception("pipeline.unexpected_failure", run_id=config.run_id)
         manifest.status = RunStatus.FAILED
         manifest.error_msg = str(exc)
-        await adapters.storage.update_run_status(
-            config.run_id, RunStatus.FAILED, error_msg=str(exc)
-        )
+        try:
+            await adapters.storage.update_run_status(
+                config.run_id, RunStatus.FAILED, error_msg=str(exc)
+            )
+        except Exception as status_exc:  # noqa: BLE001
+            log.warning("pipeline.update_status_failed", run_id=config.run_id, error=str(status_exc))
         sink(RunFailed(run_id=config.run_id, error=str(exc)))
         return manifest
 
     manifest.status = RunStatus.COMPLETED
     manifest.completed_at = datetime.now(timezone.utc)
-    await adapters.storage.update_run_status(config.run_id, RunStatus.COMPLETED)
+    try:
+        await adapters.storage.update_run_status(config.run_id, RunStatus.COMPLETED)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("pipeline.update_status_failed", run_id=config.run_id, error=str(exc))
 
     duration = (manifest.completed_at - started_at).total_seconds()
     sink(
@@ -248,12 +316,16 @@ async def _stage_query_generation(
 
     try:
         async with asyncio.timeout(STAGE_BUDGETS_S[stage]):
+            query_budget = _query_budget_for_doc_target(
+                doc_count=config.doc_count,
+                configured_max=config.max_queries,
+            )
             queries: list[Query] = await run_query_agent(
                 topic=config.topic,
                 run_id=config.run_id,
                 llm=adapters.llm,
                 max_depth=config.max_depth,
-                max_queries=config.max_queries,
+                max_queries=query_budget,
                 relevance_threshold=config.relevance_threshold,
             )
     except asyncio.TimeoutError as exc:
@@ -276,13 +348,17 @@ async def _stage_query_generation(
         failure_count=0,
     )
     manifest.stages[stage] = stats
-    await adapters.storage.save_stage_stats(config.run_id, stats)
+    try:
+        await adapters.storage.save_stage_stats(config.run_id, stats)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("query_generation.stats_save_failed", run_id=config.run_id, error=str(exc))
 
     sink(QueriesGenerated(run_id=config.run_id, count=len(queries)))
     sink(StageCompleted(run_id=config.run_id, stage=stage, stats=stats))
     log.info(
         "stage.query_generation.done",
         run_id=config.run_id,
+        query_budget=query_budget,
         queries=len(queries),
         duration_s=(completed - started).total_seconds(),
     )
@@ -300,8 +376,8 @@ async def _stage_url_discovery(
     started = datetime.now(timezone.utc)
     sink(StageStarted(run_id=config.run_id, stage=stage, at=started))
 
-    # How many URLs do we need? Aim for 2× doc_count to survive scrape failures.
-    target_urls = max(100, config.doc_count * 2)
+    # How many URLs do we need? Aim for 5× doc_count to survive validation/scrape losses.
+    target_urls = max(100, config.doc_count * URLS_PER_DOC_TARGET)
     per_query = max(5, target_urls // max(1, len(queries)))
 
     unique_hashes: set[str] = set()
@@ -316,7 +392,24 @@ async def _stage_url_discovery(
             async def _one(q: Query) -> list[DiscoveredURL]:
                 async with sem:
                     try:
-                        return await adapters.search.discover_urls(q, limit=per_query)
+                        discovered = await adapters.search.discover_urls(
+                            q, limit=per_query
+                        )
+                        if discovered:
+                            return discovered
+
+                        # Fallback: LLM-generated queries can be long and brittle for
+                        # search backends (especially URL-indexed ones like CC-CDX).
+                        # Retry once with a compact keyword query before giving up.
+                        simplified = _simplify_query_text(q.text)
+                        if simplified and simplified != q.text:
+                            q_fallback = q.model_copy(update={"text": simplified})
+                            retry_limit = max(per_query, 10)
+                            return await adapters.search.discover_urls(
+                                q_fallback,
+                                limit=retry_limit,
+                            )
+                        return []
                     except Exception as exc:  # noqa: BLE001
                         log.warning(
                             "url_discovery.query_failed",
@@ -372,7 +465,10 @@ async def _stage_url_discovery(
         failure_count=failure_count,
     )
     manifest.stages[stage] = stats
-    await adapters.storage.save_stage_stats(config.run_id, stats)
+    try:
+        await adapters.storage.save_stage_stats(config.run_id, stats)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("url_discovery.stats_save_failed", run_id=config.run_id, error=str(exc))
 
     sink(StageCompleted(run_id=config.run_id, stage=stage, stats=stats))
     log.info(
@@ -469,6 +565,20 @@ async def _stage_url_validation(
             run_id=config.run_id, budget_s=STAGE_BUDGETS_S[stage],
         )
         # Timeout → fall back to the pre-validation set
+        kept = urls
+        dropped_count = 0
+
+    # Guardrail: if validation is too aggressive, don't starve scraping.
+    # Keep at least enough candidates to plausibly hit doc_count.
+    min_keep_needed = min(len(urls), max(100, config.doc_count))
+    if len(kept) < min_keep_needed:
+        log.warning(
+            "url_validation.over_dropped_fallback",
+            run_id=config.run_id,
+            input_count=len(urls),
+            kept=len(kept),
+            min_keep_needed=min_keep_needed,
+        )
         kept = urls
         dropped_count = 0
 
@@ -697,7 +807,10 @@ async def _stage_scrape(
         failure_count=len(failures),
     )
     manifest.stages[stage] = stats
-    await adapters.storage.save_stage_stats(config.run_id, stats)
+    try:
+        await adapters.storage.save_stage_stats(config.run_id, stats)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("scrape.stats_save_failed", run_id=config.run_id, error=str(exc))
 
     sink(StageCompleted(run_id=config.run_id, stage=stage, stats=stats))
     log.info(
@@ -770,7 +883,10 @@ async def _stage_finalize(
         output_count=len(docs),
         failure_count=len(failures),
     )
-    await adapters.storage.save_stage_stats(config.run_id, manifest.stages[stage])
+    try:
+        await adapters.storage.save_stage_stats(config.run_id, manifest.stages[stage])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("finalize.stats_save_failed", run_id=config.run_id, error=str(exc))
 
     sink(StageCompleted(run_id=config.run_id, stage=stage, stats=manifest.stages[stage]))
     log.info(

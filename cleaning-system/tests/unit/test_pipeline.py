@@ -116,3 +116,28 @@ async def test_pipeline_keeps_all_unique_english_docs(populated_data_dir: Path):
 
     # All 10 sample docs are unique English text that should survive all fast stages
     assert report.after_gopher == 10
+
+
+@pytest.mark.asyncio
+async def test_pipeline_guardrail_prevents_large_cleaning_drop(
+    populated_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from cleaning_system.stages import gopher
+
+    def _drop_all(docs, config):
+        return []
+
+    monkeypatch.setattr(gopher, "run", _drop_all)
+
+    config = CleaningConfig(
+        run_id="test-run",
+        topic="DevOps",
+        data_dir=populated_data_dir,
+        enable_perplexity=False,
+        enable_relevance=False,
+        enable_trafilatura=False,
+        min_cleaning_keep_ratio=0.75,
+    )
+    report = await run_cleaning(config)
+
+    assert report.after_gopher >= int(report.input_docs * 0.75)
