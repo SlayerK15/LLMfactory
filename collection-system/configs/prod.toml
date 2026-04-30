@@ -1,9 +1,0 @@
-# Production overrides
-[app]
-log_level = "INFO"
-
-[scraper]
-concurrency = 40
-
-[reliability]
-global_timeout_s = 1800
